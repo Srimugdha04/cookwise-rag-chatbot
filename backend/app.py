@@ -73,16 +73,22 @@ def ingest():
     """
     Fetch cooking-related content from Wikipedia topics,
     embed them, and store in Chroma vector DB.
+
+    If Wikipedia cannot be reached or returns no data,
+    fall back to a built-in cooking knowledge dataset.
     """
     docs = []
     metas = []
     ids = []
 
+    # Try online data source: Wikipedia
     for title in TOPICS:
         try:
             url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote(title)}"
             resp = requests.get(url, timeout=10)
+
             if resp.status_code != 200:
+                print(f"Wiki {title}: status {resp.status_code}")
                 continue
 
             data = resp.json()
@@ -94,21 +100,36 @@ def ingest():
             )
 
             if not text:
+                print(f"Wiki {title}: empty extract")
                 continue
 
             docs.append(text)
             metas.append({"title": title, "source": page_url})
             ids.append(str(uuid.uuid4()))
-
         except Exception as e:
             print(f"Error fetching {title}: {e}")
             continue
 
+    # Fallback: built-in dataset if Wikipedia gave nothing
     if not docs:
-        return jsonify({
-            "status": "error",
-            "message": "No documents fetched from Wikipedia."
-        }), 500
+        print("No docs from Wikipedia. Using fallback cooking dataset.")
+        fallback_docs = [
+            "Italian cuisine is known for pasta, pizza, olive oil, tomatoes, herbs like basil and oregano, and simple recipes that focus on fresh ingredients.",
+            "Indian cuisine uses a large variety of spices such as turmeric, cumin, coriander, garam masala, chili, and often combines them in layered curries.",
+            "Baking is a dry-heat cooking method that uses an oven. Common baked foods include bread, cakes, cookies, and pies.",
+            "Grilling cooks food over direct high heat, usually from below, creating smoky flavors and grill marks on meat and vegetables.",
+            "Food safety in the kitchen includes washing hands, avoiding cross-contamination of raw meat and vegetables, cooking meat to safe internal temperatures, and refrigerating leftovers quickly.",
+            "Mediterranean cuisine emphasizes vegetables, legumes, whole grains, olive oil, fish, and moderate dairy, and is associated with heart-health benefits.",
+            "Vegan cooking avoids all animal products, including meat, dairy, eggs, and honey, and often uses beans, lentils, tofu, and nuts for protein.",
+            "Desserts include sweet dishes like cakes, ice cream, custards, and pastries, usually served at the end of a meal."
+        ]
+        for i, text in enumerate(fallback_docs):
+            docs.append(text)
+            metas.append({
+                "title": f"Fallback doc {i+1}",
+                "source": "local-fallback"
+            })
+            ids.append(str(uuid.uuid4()))
 
     embeddings = embed_texts(docs)
     collection.add(
@@ -122,7 +143,6 @@ def ingest():
         "status": "ok",
         "documents_added": len(docs)
     })
-
 
 @app.post("/chat")
 def chat():
