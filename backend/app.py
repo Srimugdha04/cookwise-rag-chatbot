@@ -7,14 +7,22 @@ from flask_cors import CORS
 import requests
 import chromadb
 from chromadb.config import Settings
-from openai import OpenAI
 
 # ---------- Config ----------
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    print("⚠️ WARNING: OPENAI_API_KEY not set. Set it in Render dashboard.")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+# Google Gemini API key (from Google AI Studio / makersuite).
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    print("⚠️ WARNING: GEMINI_API_KEY not set. Set it in Render dashboard.")
+
+GEMINI_EMBED_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "text-embedding-004:embedContent"
+)
+GEMINI_CHAT_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "gemini-1.5-flash:generateContent"
+)
 
 # Wikipedia topics for cooking / cuisine – our online data source
 TOPICS = [
@@ -27,45 +35,83 @@ TOPICS = [
     "Veganism",
     "Food safety",
     "Mediterranean cuisine",
-    "Dessert"
+    "Dessert",
 ]
 
 # ---------- Flask App ----------
+
 app = Flask(__name__)
 CORS(app)
 
 # ---------- Chroma Vector DB ----------
-# Persistent client so data survives restarts (on Render disk)
-chroma_client = chromadb.PersistentClient(
-    path="./chroma_db",
-    settings=Settings(allow_reset=True)
-)
 
+chroma_client = chromadb.PersistentClient(
+    path="./chroma_db", settings=Settings(allow_reset=True)
+)
 collection = chroma_client.get_or_create_collection(name="cook_knowledge")
 
 
 def embed_texts(texts):
     """
-    Use OpenAI embeddings to convert text -> vector.
+    Use Gemini text-embedding-004 to convert text -> vectors.
     """
     if not texts:
         return []
 
-    response = client.embeddings.create(
-        model="text-embedding-3-small",
-        input=texts
-    )
-    return [d.embedding for d in response.data]
+    embeddings = []
+    for text in texts:
+        try:
+            payload = {
+                "model": "models/text-embedding-004",
+                "content": {"parts": [{"text": text}]},
+            }
+            resp = requests.post(
+                GEMINI_EMBED_URL,
+                params={"key": GEMINI_API_KEY},
+                json=payload,
+                timeout=20,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            vec = data["embedding"]["values"]
+            embeddings.append(vec)
+        except Exception as e:
+            print(f"Embedding error: {e}")
+            # simple fallback: zero vector of length 768
+            if embeddings:
+                dim = len(embeddings[0])
+            else:
+                dim = 768
+            embeddings.append([0.0] * dim)
+
+    return embeddings
 
 
-# ---------- Routes ----------
+def build_prompt_from_messages(messages):
+    """
+    Turn list of {role, content} into a single text prompt for Gemini.
+    """
+    lines = []
+    for m in messages:
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        if not content:
+            continue
+        if role == "system":
+            prefix = "System"
+        elif role == "assistant":
+            prefix = "Assistant"
+        else:
+            prefix = "User"
+        lines.append(f"{prefix}: {content}")
+    return "\n\n".join(lines)
+
 
 @app.get("/")
 def health():
-    return jsonify({
-        "status": "ok",
-        "message": "CookWise RAG backend is running."
-    })
+    return jsonify(
+        {"status": "ok", "message": "CookWise RAG backend (Gemini) is running."}
+    )
 
 
 @app.post("/ingest")
@@ -84,7 +130,10 @@ def ingest():
     # Try online data source: Wikipedia
     for title in TOPICS:
         try:
-            url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote(title)}"
+            url = (
+                "https://en.wikipedia.org/api/rest_v1/page/summary/"
+                f"{quote(title)}"
+            )
             resp = requests.get(url, timeout=10)
 
             if resp.status_code != 200:
@@ -121,33 +170,29 @@ def ingest():
             "Food safety in the kitchen includes washing hands, avoiding cross-contamination of raw meat and vegetables, cooking meat to safe internal temperatures, and refrigerating leftovers quickly.",
             "Mediterranean cuisine emphasizes vegetables, legumes, whole grains, olive oil, fish, and moderate dairy, and is associated with heart-health benefits.",
             "Vegan cooking avoids all animal products, including meat, dairy, eggs, and honey, and often uses beans, lentils, tofu, and nuts for protein.",
-            "Desserts include sweet dishes like cakes, ice cream, custards, and pastries, usually served at the end of a meal."
+            "Desserts include sweet dishes like cakes, ice cream, custards, and pastries, usually served at the end of a meal.",
         ]
         for i, text in enumerate(fallback_docs):
             docs.append(text)
-            metas.append({
-                "title": f"Fallback doc {i+1}",
-                "source": "local-fallback"
-            })
+            metas.append(
+                {"title": f"Fallback doc {i+1}", "source": "local-fallback"}
+            )
             ids.append(str(uuid.uuid4()))
 
+    # Embed and store in Chroma
     embeddings = embed_texts(docs)
     collection.add(
-        documents=docs,
-        metadatas=metas,
-        ids=ids,
-        embeddings=embeddings
+        documents=docs, metadatas=metas, ids=ids, embeddings=embeddings
     )
 
-    return jsonify({
-        "status": "ok",
-        "documents_added": len(docs)
-    })
+    return jsonify({"status": "ok", "documents_added": len(docs)})
+
 
 @app.post("/chat")
 def chat():
     """
     RAG Chat endpoint.
+
     Body:
     {
       "message": "How to make Italian pasta?",
@@ -161,22 +206,16 @@ def chat():
     if not user_message:
         return jsonify({"error": "message is required"}), 400
 
-    # Ensure we have some documents ingested
-    count = collection.count()
-    if count == 0:
-        return jsonify({
-            "error": "Knowledge base is empty. Call /ingest first."
-        }), 400
+    if collection.count() == 0:
+        return jsonify(
+            {"error": "Knowledge base is empty. Call /ingest first."}
+        ), 400
 
     # 1) Embed the query
     query_embedding = embed_texts([user_message])[0]
 
     # 2) Retrieve top-k similar docs
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=5
-    )
-
+    results = collection.query(query_embeddings=[query_embedding], n_results=5)
     docs = results["documents"][0]
     metadatas = results["metadatas"][0]
 
@@ -197,17 +236,16 @@ def chat():
             "content": (
                 "You are CookWise, an expert cooking assistant. "
                 "Answer ONLY using the provided context. "
-                "If something is unknown, say you are not sure"
-                " instead of making it up."
-            )
+                "If something is unknown, say you are not sure "
+                "instead of making it up."
+            ),
         },
         {
             "role": "system",
-            "content": f"Knowledge base context:\n{context_str}"
-        }
+            "content": f"Knowledge base context:\n{context_str}",
+        },
     ]
 
-    # Include last few turns of history
     for h in history[-6:]:
         role = h.get("role")
         content = h.get("content")
@@ -216,22 +254,39 @@ def chat():
 
     messages.append({"role": "user", "content": user_message})
 
-    # 4) Call LLM
-    completion = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=messages,
-        temperature=0.4
-    )
+    prompt_text = build_prompt_from_messages(messages)
 
-    answer = completion.choices[0].message.content
+    # 4) Call Gemini for generation
+    try:
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {
+                            "text": prompt_text,
+                        }
+                    ]
+                }
+            ]
+        }
+        resp = requests.post(
+            GEMINI_CHAT_URL,
+            params={"key": GEMINI_API_KEY},
+            json=payload,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        answer = (
+            data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        )
+    except Exception as e:
+        print(f"Gemini chat error: {e}")
+        return jsonify({"error": "LLM generation failed"}), 500
 
-    return jsonify({
-        "answer": answer,
-        "sources": metadatas
-    })
+    return jsonify({"answer": answer, "sources": metadatas})
 
 
 if __name__ == "__main__":
-    # For local testing only. On Render we use gunicorn.
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
