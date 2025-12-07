@@ -1,123 +1,98 @@
 import os
+import math
 import uuid
-from urllib.parse import quote
-
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import requests
-import chromadb
-from chromadb.config import Settings
 
-# ---------- Config ----------
+# ---------- CONFIG ----------
 
-# Google Gemini API key (from Google AI Studio / makersuite).
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     print("⚠️ WARNING: GEMINI_API_KEY not set. Set it in Render dashboard.")
 
-GEMINI_EMBED_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    "text-embedding-004:embedContent"
-)
 GEMINI_CHAT_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     "gemini-1.5-flash:generateContent"
 )
 
-# Wikipedia topics for cooking / cuisine – our online data source
-TOPICS = [
-    "Italian cuisine",
-    "Indian cuisine",
-    "Chinese cuisine",
-    "Baking",
-    "Grilling",
-    "Spices",
-    "Veganism",
-    "Food safety",
-    "Mediterranean cuisine",
-    "Dessert",
-]
-
-# ---------- Flask App ----------
-
 app = Flask(__name__)
 CORS(app)
 
-# ---------- Chroma Vector DB ----------
-
-chroma_client = chromadb.PersistentClient(
-    path="./chroma_db", settings=Settings(allow_reset=True)
-)
-collection = chroma_client.get_or_create_collection(name="cook_knowledge")
+# In-memory "vector store"
+DOCUMENTS = []       # list of strings
+METADATAS = []       # list of dicts
+EMBEDDINGS = []      # list of vectors (list[float])
 
 
-def embed_texts(texts):
+# ---------- SIMPLE LOCAL EMBEDDINGS & RETRIEVAL ----------
+
+def embed_text(text: str):
     """
-    Lightweight local embedding: convert each text into a small numeric vector.
-    No external API calls, so it's fast and safe for free-tier deployment.
+    Very lightweight local embedding:
+    We turn a text into a small numeric feature vector.
+    No network, no external API, fast for free-tier.
     """
-    embeddings = []
-    for text in texts:
-        t = text.lower()
-        length = len(t)
-        words = t.split()
-        word_count = len(words)
-        vowels = sum(t.count(v) for v in "aeiou")
-        consonants = sum(c.isalpha() for c in t) - vowels
-        avg_word_len = length / max(word_count, 1)
+    t = text.lower()
+    length = len(t)
+    words = t.split()
+    word_count = len(words)
+    vowels = sum(t.count(v) for v in "aeiou")
+    consonants = sum(c.isalpha() for c in t) - vowels
+    avg_word_len = length / max(word_count, 1)
 
-        vec = [
-            float(length),
-            float(word_count),
-            float(vowels),
-            float(consonants),
-            float(avg_word_len),
-        ]
-        embeddings.append(vec)
-
-    return embeddings
+    return [
+        float(length),
+        float(word_count),
+        float(vowels),
+        float(consonants),
+        float(avg_word_len),
+    ]
 
 
-def build_prompt_from_messages(messages):
-    """
-    Turn list of {role, content} into a single text prompt for Gemini.
-    """
-    lines = []
-    for m in messages:
-        role = m.get("role", "user")
-        content = m.get("content", "")
-        if not content:
-            continue
-        if role == "system":
-            prefix = "System"
-        elif role == "assistant":
-            prefix = "Assistant"
-        else:
-            prefix = "User"
-        lines.append(f"{prefix}: {content}")
-    return "\n\n".join(lines)
+def cosine_sim(a, b):
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
 
+
+def top_k_docs(query, k=5):
+    if not DOCUMENTS:
+        return [], []
+
+    q_emb = embed_text(query)
+    scored = []
+    for i, emb in enumerate(EMBEDDINGS):
+        score = cosine_sim(q_emb, emb)
+        scored.append((score, i))
+
+    scored.sort(reverse=True, key=lambda x: x[0])
+    top = scored[:k]
+
+    docs = [DOCUMENTS[i] for _, i in top]
+    metas = [METADATAS[i] for _, i in top]
+    return docs, metas
+
+
+# ---------- ROUTES ----------
 
 @app.get("/")
 def health():
-    return jsonify(
-        {"status": "ok", "message": "CookWise RAG backend (Gemini) is running."}
-    )
+    return jsonify({
+        "status": "ok",
+        "message": "CookWise RAG backend (lightweight) is running."
+    })
 
 
 @app.post("/ingest")
 def ingest():
     """
-    Load a built-in cooking knowledge dataset, embed it locally,
-    and store it in Chroma.
-
-    (Wikipedia fetching is disabled here to avoid network / timeout issues
-    on free-tier hosting. The README can still mention that the design
-    supports online sources.)
+    Load a built-in cooking knowledge dataset, compute local embeddings,
+    store them in in-memory lists. Fast and stable on free-tier.
     """
-    docs = []
-    metas = []
-    ids = []
+    global DOCUMENTS, METADATAS, EMBEDDINGS
 
     fallback_docs = [
         "Italian cuisine is known for pasta, pizza, olive oil, tomatoes, herbs like basil and oregano, and simple recipes that focus on fresh ingredients.",
@@ -130,33 +105,29 @@ def ingest():
         "Desserts include sweet dishes like cakes, ice cream, custards, and pastries, usually served at the end of a meal.",
     ]
 
+    DOCUMENTS = []
+    METADATAS = []
+    EMBEDDINGS = []
+
     for i, text in enumerate(fallback_docs):
-        docs.append(text)
-        metas.append({"title": f"Cooking doc {i+1}", "source": "local-fallback"})
-        ids.append(str(uuid.uuid4()))
+        DOCUMENTS.append(text)
+        METADATAS.append({
+            "id": str(uuid.uuid4()),
+            "title": f"Cooking doc {i+1}",
+            "source": "local-fallback"
+        })
+        EMBEDDINGS.append(embed_text(text))
 
-    # Clear old data if any (optional)
-    try:
-        collection.delete(where={})
-    except Exception:
-        pass
-
-    embeddings = embed_texts(docs)
-    collection.add(
-        documents=docs,
-        metadatas=metas,
-        ids=ids,
-        embeddings=embeddings,
-    )
-
-    return jsonify({"status": "ok", "documents_added": len(docs)})
+    return jsonify({
+        "status": "ok",
+        "documents_added": len(DOCUMENTS)
+    })
 
 
 @app.post("/chat")
 def chat():
     """
-    RAG Chat endpoint.
-
+    RAG chat endpoint.
     Body:
     {
       "message": "How to make Italian pasta?",
@@ -170,22 +141,14 @@ def chat():
     if not user_message:
         return jsonify({"error": "message is required"}), 400
 
-    if collection.count() == 0:
-        return jsonify(
-            {"error": "Knowledge base is empty. Call /ingest first."}
-        ), 400
+    if not DOCUMENTS:
+        return jsonify({"error": "Knowledge base is empty. Call /ingest first."}), 400
 
-    # 1) Embed the query
-    query_embedding = embed_texts([user_message])[0]
+    # 1) Retrieve top docs using local embeddings
+    docs, metas = top_k_docs(user_message, k=5)
 
-    # 2) Retrieve top-k similar docs
-    results = collection.query(query_embeddings=[query_embedding], n_results=5)
-    docs = results["documents"][0]
-    metadatas = results["metadatas"][0]
-
-    # Build context string
     context_blocks = []
-    for text, meta in zip(docs, metadatas):
+    for text, meta in zip(docs, metas):
         title = meta.get("title", "Unknown")
         source = meta.get("source", "")
         block = f"Title: {title}\nSource: {source}\nContent: {text}"
@@ -193,46 +156,38 @@ def chat():
 
     context_str = "\n\n---\n\n".join(context_blocks)
 
-    # 3) Build chat messages with multi-turn history
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are CookWise, an expert cooking assistant. "
-                "Answer ONLY using the provided context. "
-                "If something is unknown, say you are not sure "
-                "instead of making it up."
-            ),
-        },
-        {
-            "role": "system",
-            "content": f"Knowledge base context:\n{context_str}",
-        },
+    # 2) Build prompt for Gemini
+    lines = [
+        "System: You are CookWise, an expert cooking assistant.",
+        "System: Answer ONLY using the provided context. "
+        "If the answer is not in the context, say you are not sure.",
+        f"System: Context:\n{context_str}",
     ]
 
     for h in history[-6:]:
         role = h.get("role")
         content = h.get("content")
-        if role in ("user", "assistant") and content:
-            messages.append({"role": role, "content": content})
+        if not content:
+            continue
+        if role == "assistant":
+            lines.append(f"Assistant: {content}")
+        else:
+            lines.append(f"User: {content}")
 
-    messages.append({"role": "user", "content": user_message})
+    lines.append(f"User: {user_message}")
+    prompt_text = "\n\n".join(lines)
 
-    prompt_text = build_prompt_from_messages(messages)
-
-    # 4) Call Gemini for generation
     try:
         payload = {
             "contents": [
                 {
                     "parts": [
-                        {
-                            "text": prompt_text,
-                        }
+                        {"text": prompt_text}
                     ]
                 }
             ]
         }
+
         resp = requests.post(
             GEMINI_CHAT_URL,
             params={"key": GEMINI_API_KEY},
@@ -241,14 +196,12 @@ def chat():
         )
         resp.raise_for_status()
         data = resp.json()
-        answer = (
-            data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        )
+        answer = data["candidates"][0]["content"]["parts"][0]["text"].strip()
     except Exception as e:
         print(f"Gemini chat error: {e}")
         return jsonify({"error": "LLM generation failed"}), 500
 
-    return jsonify({"answer": answer, "sources": metadatas})
+    return jsonify({"answer": answer, "sources": metas})
 
 
 if __name__ == "__main__":
