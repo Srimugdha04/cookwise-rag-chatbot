@@ -1,5 +1,5 @@
 // TODO: replace this after backend deployment:
-const API_BASE = "https://YOUR-RENDER-BACKEND-URL.onrender.com";
+const API_BASE = "https://cookwise-rag-chatbot.onrender.com";
 
 let history = [];
 
