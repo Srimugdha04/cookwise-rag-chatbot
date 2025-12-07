@@ -1,6 +1,4 @@
 flask
 flask-cors
-chromadb
-openai
 requests
 gunicorn
