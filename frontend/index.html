@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>CookWise RAG Chatbot</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <header>
+      <h1>🍳 CookWise RAG Chatbot</h1>
+      <p>Ask anything about cooking, cuisines, and techniques.</p>
+    </header>
+
+    <section class="controls">
+      <button id="ingestBtn">Load Knowledge (Wikipedia)</button>
+      <span id="status"></span>
+    </section>
+
+    <section id="chat" class="chat"></section>
+
+    <section class="input-area">
+      <textarea id="message" placeholder="Ask a cooking question..."></textarea>
+      <button id="sendBtn">Send</button>
+    </section>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>
