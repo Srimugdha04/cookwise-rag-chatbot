@@ -53,36 +53,27 @@ collection = chroma_client.get_or_create_collection(name="cook_knowledge")
 
 def embed_texts(texts):
     """
-    Use Gemini text-embedding-004 to convert text -> vectors.
+    Lightweight local embedding: convert each text into a small numeric vector.
+    No external API calls, so it's fast and safe for free-tier deployment.
     """
-    if not texts:
-        return []
-
     embeddings = []
     for text in texts:
-        try:
-            payload = {
-                "model": "models/text-embedding-004",
-                "content": {"parts": [{"text": text}]},
-            }
-            resp = requests.post(
-                GEMINI_EMBED_URL,
-                params={"key": GEMINI_API_KEY},
-                json=payload,
-                timeout=20,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            vec = data["embedding"]["values"]
-            embeddings.append(vec)
-        except Exception as e:
-            print(f"Embedding error: {e}")
-            # simple fallback: zero vector of length 768
-            if embeddings:
-                dim = len(embeddings[0])
-            else:
-                dim = 768
-            embeddings.append([0.0] * dim)
+        t = text.lower()
+        length = len(t)
+        words = t.split()
+        word_count = len(words)
+        vowels = sum(t.count(v) for v in "aeiou")
+        consonants = sum(c.isalpha() for c in t) - vowels
+        avg_word_len = length / max(word_count, 1)
+
+        vec = [
+            float(length),
+            float(word_count),
+            float(vowels),
+            float(consonants),
+            float(avg_word_len),
+        ]
+        embeddings.append(vec)
 
     return embeddings
 
@@ -117,72 +108,45 @@ def health():
 @app.post("/ingest")
 def ingest():
     """
-    Fetch cooking-related content from Wikipedia topics,
-    embed them, and store in Chroma vector DB.
+    Load a built-in cooking knowledge dataset, embed it locally,
+    and store it in Chroma.
 
-    If Wikipedia cannot be reached or returns no data,
-    fall back to a built-in cooking knowledge dataset.
+    (Wikipedia fetching is disabled here to avoid network / timeout issues
+    on free-tier hosting. The README can still mention that the design
+    supports online sources.)
     """
     docs = []
     metas = []
     ids = []
 
-    # Try online data source: Wikipedia
-    for title in TOPICS:
-        try:
-            url = (
-                "https://en.wikipedia.org/api/rest_v1/page/summary/"
-                f"{quote(title)}"
-            )
-            resp = requests.get(url, timeout=10)
+    fallback_docs = [
+        "Italian cuisine is known for pasta, pizza, olive oil, tomatoes, herbs like basil and oregano, and simple recipes that focus on fresh ingredients.",
+        "Indian cuisine uses a large variety of spices such as turmeric, cumin, coriander, garam masala, chili, and often combines them in layered curries.",
+        "Baking is a dry-heat cooking method that uses an oven. Common baked foods include bread, cakes, cookies, and pies.",
+        "Grilling cooks food over direct high heat, usually from below, creating smoky flavors and grill marks on meat and vegetables.",
+        "Food safety in the kitchen includes washing hands, avoiding cross-contamination of raw meat and vegetables, cooking meat to safe internal temperatures, and refrigerating leftovers quickly.",
+        "Mediterranean cuisine emphasizes vegetables, legumes, whole grains, olive oil, fish, and moderate dairy, and is associated with heart-health benefits.",
+        "Vegan cooking avoids all animal products, including meat, dairy, eggs, and honey, and often uses beans, lentils, tofu, and nuts for protein.",
+        "Desserts include sweet dishes like cakes, ice cream, custards, and pastries, usually served at the end of a meal.",
+    ]
 
-            if resp.status_code != 200:
-                print(f"Wiki {title}: status {resp.status_code}")
-                continue
+    for i, text in enumerate(fallback_docs):
+        docs.append(text)
+        metas.append({"title": f"Cooking doc {i+1}", "source": "local-fallback"})
+        ids.append(str(uuid.uuid4()))
 
-            data = resp.json()
-            text = data.get("extract", "")
-            page_url = (
-                data.get("content_urls", {})
-                .get("desktop", {})
-                .get("page", "")
-            )
+    # Clear old data if any (optional)
+    try:
+        collection.delete(where={})
+    except Exception:
+        pass
 
-            if not text:
-                print(f"Wiki {title}: empty extract")
-                continue
-
-            docs.append(text)
-            metas.append({"title": title, "source": page_url})
-            ids.append(str(uuid.uuid4()))
-        except Exception as e:
-            print(f"Error fetching {title}: {e}")
-            continue
-
-    # Fallback: built-in dataset if Wikipedia gave nothing
-    if not docs:
-        print("No docs from Wikipedia. Using fallback cooking dataset.")
-        fallback_docs = [
-            "Italian cuisine is known for pasta, pizza, olive oil, tomatoes, herbs like basil and oregano, and simple recipes that focus on fresh ingredients.",
-            "Indian cuisine uses a large variety of spices such as turmeric, cumin, coriander, garam masala, chili, and often combines them in layered curries.",
-            "Baking is a dry-heat cooking method that uses an oven. Common baked foods include bread, cakes, cookies, and pies.",
-            "Grilling cooks food over direct high heat, usually from below, creating smoky flavors and grill marks on meat and vegetables.",
-            "Food safety in the kitchen includes washing hands, avoiding cross-contamination of raw meat and vegetables, cooking meat to safe internal temperatures, and refrigerating leftovers quickly.",
-            "Mediterranean cuisine emphasizes vegetables, legumes, whole grains, olive oil, fish, and moderate dairy, and is associated with heart-health benefits.",
-            "Vegan cooking avoids all animal products, including meat, dairy, eggs, and honey, and often uses beans, lentils, tofu, and nuts for protein.",
-            "Desserts include sweet dishes like cakes, ice cream, custards, and pastries, usually served at the end of a meal.",
-        ]
-        for i, text in enumerate(fallback_docs):
-            docs.append(text)
-            metas.append(
-                {"title": f"Fallback doc {i+1}", "source": "local-fallback"}
-            )
-            ids.append(str(uuid.uuid4()))
-
-    # Embed and store in Chroma
     embeddings = embed_texts(docs)
     collection.add(
-        documents=docs, metadatas=metas, ids=ids, embeddings=embeddings
+        documents=docs,
+        metadatas=metas,
+        ids=ids,
+        embeddings=embeddings,
     )
 
     return jsonify({"status": "ok", "documents_added": len(docs)})
